@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 実行時に生成されるもの
+config.json
+hellomovie_downloads/
+*.part
+.venv/
+venv/
+
+# 解析用の一時ファイル
+analysis/
+tools/
+*.zip
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
