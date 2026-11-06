@@ -86,14 +86,16 @@ python hellomovie_launcher.py
 5. 完了後に復号するか確認されるので `y`
 
 保存先は実行ディレクトリの `hellomovie_downloads/` です。
+ファイル名には作品名と種類が入ります (`<ID>_<作品名>_<種類>_v<バージョン>`)。
 
 ```
 hellomovie_downloads/
 ├── movies.json                     # 作品一覧 (token を含む)
-├── 2116_voiceguide_v1.zip          # 生パッケージ
-├── 2116_image_v1.png               # サムネイル
+├── tokens.json                     # token バックアップ (消えた作品も保持)
+├── 2116_【バリアフリー版】劇場版 魔法少女まどか☆マギカ〈ワルプルギスの廻天〉_音声ガイド_v1.zip
+├── 2116_【バリアフリー版】劇場版 魔法少女まどか☆マギカ〈ワルプルギスの廻天〉_画像_v1.png
 └── decrypted/
-    └── 2116_voiceguide_v1/
+    └── 2116_【バリアフリー版】劇場版 魔法少女まどか☆マギカ〈ワルプルギスの廻天〉_音声ガイド_v1/
         └── voiceguide/
             ├── data/
             │   ├── sound.ogg       # 本編音声
@@ -107,13 +109,16 @@ hellomovie_downloads/
 
 ```
 hellomovie_downloads/
-├── 2115_subtitles_v1.zip
+├── 2115_【バリアフリー版】…_字幕_v1.zip
 └── decrypted/
-    └── 2115_subtitles_v1/
+    └── 2115_【バリアフリー版】…_字幕_v1/
         └── subtitles/
             ├── png/1.png, 2.png, ...
             └── png/time.csv
 ```
+
+> 従来の `<ID>_subtitles_v1.zip` / `<ID>_voiceguide_v1.zip` という名前の ZIP も
+> そのまま復号できます (復号済みのフォルダも引き継がれます)。
 
 ### 2. ダウンロード済みファイルの復号
 
@@ -129,6 +134,65 @@ hellomovie_downloads/
 python hellomovie_launcher.py --lang en
 python hellomovie_launcher.py --mode decrypt
 ```
+
+---
+
+## token バックアップ (`tokens.json`)
+
+作品ごとの `token` はカタログ (`movies.json`) に載っていますが、**配信が終わると
+カタログから作品が消え、token も手元から消えます**。すると保存済みの ZIP が
+復号できなくなるため、ダウンロードのたびに `hellomovie_downloads/tokens.json` へ
+「一度でも掲載された作品の token と作品名」を蓄積します (消しません)。
+
+```json
+{
+  "version": 1,
+  "updated": "2026-11-07T04:20:31Z",
+  "titles": {
+    "2144": {
+      "token": 1234567890,
+      "name": "【コメンタリー版】超かぐや姫！",
+      "contenttype": 2,
+      "voiceguide_version": 1,
+      "subtitle_version": 0,
+      "first_seen": "2026-11-01T01:11:00Z",
+      "last_seen": "2026-11-01T01:11:00Z"
+    }
+  }
+}
+```
+
+復号時は `movies.json` だけでなく `tokens.json` も参照するので、
+カタログから消えた作品でも保存済みの ZIP を復号できます。
+
+### token まで失った場合
+
+`tokens.json` にも無い場合は、パッケージの暗号文と平文の構造 (Ogg Opus / PNG のヘッダ)
+から token を総当たりで復元できます (CPU 10〜30 分程度)。
+
+```bash
+python tools/recover_token.py --zip hellomovie_downloads/2144_voiceguide_v1.zip
+```
+
+---
+
+## 音声ガイドと映像の同期
+
+音声ガイド (コメンタリー) を Blu-ray や Netflix の映像に同期させるツール群です。
+
+```bash
+# 映像とガイドを同時に再生 (mpv の IPC でドリフトを自動補正)
+python sync/hellomovie_sync.py play --movie "E:\ビデオ\...\00001.m2ts" --guide sound.ogg
+
+# Netflix 版と Blu-ray 版のオフセットを自動測定
+python sync/hellomovie_sync.py scan --reference Netflix.mkv --target BD.m2ts
+
+# 「今流れている音」を認識してガイドを同期再生 (公式アプリと同じ考え方)
+python sync/audio_sync.py build --movie "E:\ビデオ\...\00001.m2ts" --out fp.pkl
+python sync/audio_sync.py watch --db fp.pkl --guide sound.ogg --input loopback
+```
+
+詳しい仕組みと実測値は [docs/sync.md](docs/sync.md) にまとめています。
 
 ---
 

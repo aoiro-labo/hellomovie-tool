@@ -10,10 +10,12 @@ hellomovie_downloads/
 .venv/
 venv/
 
-# 解析用の一時ファイル
+# 解析用の一時ファイル (apsk の逆アセンブル結果など)
 analysis/
-tools/
+tools/jadx-1.5.6/
 *.zip
+*.pkl
+sync_offsets.json
 
 # OS / エディタ
 .DS_Store

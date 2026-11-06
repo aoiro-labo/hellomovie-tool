@@ -27,6 +27,34 @@ IDENTITY_POOL_ID = "us-east-1:dbd8d29b-d3e3-48e9-9a9e-a8474060acab"
 # 保存先フォルダ
 SAVE_DIRECTORY = "./hellomovie_downloads"
 
+# ファイル名に含める種別ラベル (日本語のほうが見た目で分かりやすいので日本語を使う)
+KIND_LABELS = {"subtitle": "字幕", "voiceguide": "音声ガイド", "image": "画像"}
+
+
+def safe_filename(name: str, max_len: int = 60) -> str:
+    """
+    Windows / macOS のファイル名として使える形に整える。
+
+    - 使用禁止文字と制御文字を '_' に置換
+    - 末尾の '.' と空白は名前の一部にならないよう除去
+    - 長すぎる作品名は 60 文字でカット (title_id が先頭にあるので一意性は保たれる)
+    """
+    cleaned = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name).strip().rstrip(". ")
+    return cleaned[:max_len] or "untitled"
+
+
+def package_filename(title_id: int, name: str, kind: str, version: Any) -> str:
+    """
+    ダウンロードするファイル名を作る。
+
+    例: 2116_【バリアフリー版】劇場版 魔法少女まどか☆マギカ〈ワルプルギスの廻天〉_音声ガイド_v1.zip
+    例: 1997_【映画名】_字幕_v1.zip
+    """
+    label = KIND_LABELS.get(kind, kind)
+    if version is None:
+        version = 0
+    return f"{title_id}_{safe_filename(name)}_{label}_v{version}.zip"
+
 class HelloMovieDownloader:
     """
     HELLOMovie配信サーバーからのファイル取得および対話式ダウンロード処理を行うクラス。
@@ -236,6 +264,10 @@ class HelloMovieDownloader:
     def save_movies_list(self, data: Dict[str, Any]):
         """
         取得した movies.json を保存先ディレクトリに保存します (hellomovie_decrypt.py が作品ごとの token を読み取ります)。
+
+        あわせて tokens.json (token バックアップ) を更新します。カタログには一度でも
+        載った作品の token を残すので、配信終了してカタログから消えた作品でも
+        保存済みの ZIP を後から復号できます。
         """
         path = os.path.join(self.output_dir, "movies.json")
         try:
@@ -244,6 +276,13 @@ class HelloMovieDownloader:
             logger.info(tr(f"作品一覧を {path} に保存しました。", f"Saved the title list to {path}."))
         except OSError as e:
             logger.warning(tr(f"movies.json の保存に失敗しました: {e}", f"Failed to save movies.json: {e}"))
+
+        backup_path = os.path.join(self.output_dir, hellomovie_decrypt.TOKEN_BACKUP_NAME)
+        kept = hellomovie_decrypt.update_token_backup(data.get("movies", []), backup_path)
+        logger.info(tr(
+            f"token バックアップを更新しました: {backup_path} ({kept} 件を保持)",
+            f"Updated the token backup: {backup_path} ({kept} titles kept)"
+        ))
 
     @staticmethod
     def build_file_url(item: Dict[str, Any], file_type: str) -> Optional[str]:
@@ -366,15 +405,37 @@ class HelloMovieDownloader:
             "\nExamples: '1-4' (range), '1 2 3' (multiple), '1, 3, 5' (multiple), 'all' (select all)"
         )
 
+    def load_known_tokens(self) -> Dict[int, int]:
+        """
+        既知の {title_id: token} を返します (movies.json と tokens.json バックアップの両方)。
+        カタログから消えた作品でも token バックアップがあれば復号できます。
+        """
+        movies_path = os.path.join(self.output_dir, "movies.json")
+        backup_path = os.path.join(self.output_dir, hellomovie_decrypt.TOKEN_BACKUP_NAME)
+        tokens = hellomovie_decrypt.load_token_backup(backup_path)
+        if os.path.exists(movies_path):
+            try:
+                with open(movies_path, "r", encoding="utf-8") as f:
+                    for m in json.load(f).get("movies", []):
+                        if "title_id" in m and m.get("token"):
+                            tokens[int(m["title_id"])] = int(m["token"])
+            except (OSError, ValueError):
+                pass
+        return tokens
+
     def decrypt_downloaded(self, targets: List[Tuple[str, Dict[str, Any]]]):
         """
         ダウンロード済みの ZIP を復号し、"<保存先>/decrypted/<ZIP名>" に保存します。
         :param targets: (ZIPファイル名, 作品情報) のリスト。作品情報の token を鍵の材料に使います。
         """
         succeeded = 0
+        tokens = self.load_known_tokens()
         for fname, item in targets:
             zip_path = os.path.join(self.output_dir, fname)
-            token = int(item.get("token") or 0)
+            title_id = hellomovie_decrypt.zip_title_id(fname)
+            token = int((item or {}).get("token") or 0)
+            if not token and title_id is not None:
+                token = tokens.get(title_id, 0)
             logger.info(tr(f"復号中: {fname} (token: {token})", f"Decrypting: {fname} (token: {token})"))
             try:
                 if hellomovie_decrypt.decrypt_zip(zip_path, hellomovie_decrypt.default_output_dir(zip_path), token):
@@ -403,19 +464,24 @@ class HelloMovieDownloader:
                 movies_by_id = {int(m["title_id"]): m for m in json.load(f).get("movies", []) if "title_id" in m}
         except (OSError, ValueError) as e:
             logger.error(tr(f"movies.json の読み込みに失敗しました: {e}", f"Failed to read movies.json: {e}"))
-            return
+            movies_by_id = {}
+
+        # カタログから消えた作品も token バックアップ経由で復号・表示できるようにする
+        backup_path = os.path.join(self.output_dir, hellomovie_decrypt.TOKEN_BACKUP_NAME)
+        for title_id, entry in hellomovie_decrypt.load_title_backup(backup_path).items():
+            movies_by_id.setdefault(title_id, entry)
 
         # (title_id, ファイル名) を title_id 順に並べる
         zip_files: List[Tuple[int, str]] = []
         for name in os.listdir(self.output_dir):
-            m = hellomovie_decrypt.ZIP_NAME_RE.match(name)
-            if m:
-                zip_files.append((int(m.group(1)), name))
+            title_id = hellomovie_decrypt.zip_title_id(name)
+            if title_id is not None:
+                zip_files.append((title_id, name))
         zip_files.sort()
         if not zip_files:
             print(tr(
-                f"{self.output_dir} に復号できる ZIP (<ID>_subtitles_v*.zip / <ID>_voiceguide_v*.zip) がありません。",
-                f"No decryptable ZIP files (<ID>_subtitles_v*.zip / <ID>_voiceguide_v*.zip) found in {self.output_dir}."
+                f"{self.output_dir} に復号できる ZIP (<ID>_<作品名>_字幕_v*.zip / <ID>_<作品名>_音声ガイド_v*.zip) がありません。",
+                f"No decryptable ZIP files (<ID>_<title>_字幕_v*.zip / <ID>_<title>_音声ガイド_v*.zip) found in {self.output_dir}."
             ))
             return
 
@@ -583,13 +649,13 @@ class HelloMovieDownloader:
                 if ctype == 1:
                     url = self.build_file_url(selected_item, "subtitle")
                     if url:
-                        fname = f"{t_id}_subtitles_v{selected_item.get('subtitle_version')}.zip"
+                        fname = package_filename(t_id, title_name, "subtitle", selected_item.get("subtitle_version"))
                         if self.download_file(url, fname):
                             downloaded_zips.append((fname, selected_item))
                 elif ctype == 2:
                     url = self.build_file_url(selected_item, "voiceguide")
                     if url:
-                        fname = f"{t_id}_voiceguide_v{selected_item.get('voiceguide_version')}.zip"
+                        fname = package_filename(t_id, title_name, "voiceguide", selected_item.get("voiceguide_version"))
                         if self.download_file(url, fname):
                             downloaded_zips.append((fname, selected_item))
 
@@ -599,7 +665,7 @@ class HelloMovieDownloader:
                 if url:
                     img_name = selected_item.get("image_filename", ".png")
                     ext = os.path.splitext(img_name)[1]
-                    fname = f"{t_id}_image_v{selected_item.get('image_version')}{ext}"
+                    fname = f"{t_id}_{safe_filename(title_name)}_画像_v{selected_item.get('image_version')}{ext}"
                     self.download_file(url, fname)
 
         print("\n" + "="*50)

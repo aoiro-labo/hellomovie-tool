@@ -1,0 +1,5 @@
+# 改行は LF で統一する (Windows でも checks out 時に LF になる)
+* text=auto eol=lf
+
+# バッチファイルは Windows がそのまま実行できるよう CRLF のまま
+*.bat -text

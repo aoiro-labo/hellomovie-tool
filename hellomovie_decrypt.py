@@ -7,7 +7,8 @@ import zlib
 import zipfile
 import logging
 import argparse
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import hellomovie_i18n
 from hellomovie_i18n import tr
@@ -30,8 +31,21 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 PNG_ENTRY_RE = re.compile(r"(?:^|/)png/(\d+)\.dat$")
 AUDIO_ENTRY_RE = re.compile(r"(?:^|/)data/(sound|waiting)\.dat$")
-ZIP_NAME_RE = re.compile(r"^(\d+)_(subtitles|voiceguide)_v\d+\.zip$")
+# 新命名: <ID>_<作品名>_字幕_v1.zip / <ID>_<作品名>_音声ガイド_v1.zip
+ZIP_NAME_RE = re.compile(r"^(\d+)_(.+)_(字幕|音声ガイド)_v\d+\.zip$")
+# 旧命名 (<ID>_subtitles_v1.zip など) の後方互換用
+LEGACY_ZIP_NAME_RE = re.compile(r"^(\d+)_(subtitles|voiceguide)_v\d+\.zip$")
 DECRYPTED_DIR_NAME = "decrypted"
+# 作品ごとの token を蓄積するバックアップ (カタログから作品が消えても復号できるようにする)
+TOKEN_BACKUP_NAME = "tokens.json"
+
+
+def zip_title_id(filename: str) -> Optional[int]:
+    """
+    ファイル名から title_id を取り出す (新命名と旧命名の両方に対応)。
+    """
+    m = ZIP_NAME_RE.match(filename) or LEGACY_ZIP_NAME_RE.match(filename)
+    return int(m.group(1)) if m else None
 
 
 def make_seed(name: str, token: int) -> int:
@@ -135,10 +149,112 @@ def is_valid_ogg(data: bytes) -> bool:
 def load_tokens(movies_json_path: str) -> Dict[int, int]:
     """
     movies.json から {title_id: token} を作ります。token が無い作品は 0 として扱います (アプリ側の既定値)。
+
+    同じフォルダに tokens.json (token バックアップ) があればそちらも読み込み、
+    カタログから消えた作品 (配信終了など) でも復号できるようにします。
     """
     with open(movies_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return {int(m["title_id"]): int(m.get("token") or 0) for m in data.get("movies", []) if "title_id" in m}
+    tokens = {int(m["title_id"]): int(m.get("token") or 0) for m in data.get("movies", []) if "title_id" in m}
+
+    backup_path = os.path.join(os.path.dirname(os.path.abspath(movies_json_path)), TOKEN_BACKUP_NAME)
+    for title_id, token in load_token_backup(backup_path).items():
+        tokens.setdefault(title_id, token)
+    return tokens
+
+
+def load_token_backup(backup_path: str) -> Dict[int, int]:
+    """
+    token バックアップ (tokens.json) から {title_id: token} を読み込みます。
+    """
+    if not os.path.exists(backup_path):
+        return {}
+    try:
+        with open(backup_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    tokens: Dict[int, int] = {}
+    for title_id, entry in (data.get("titles") or {}).items():
+        try:
+            token = int(entry.get("token") or 0)
+        except (TypeError, ValueError):
+            continue
+        if token:
+            tokens[int(title_id)] = token
+    return tokens
+
+
+def load_title_backup(backup_path: str) -> Dict[int, Dict[str, Any]]:
+    """
+    token バックアップから {title_id: 作品情報} を読み込みます (作品名も保持しているため)。
+    """
+    if not os.path.exists(backup_path):
+        return {}
+    try:
+        with open(backup_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    titles: Dict[int, Dict[str, Any]] = {}
+    for title_id, entry in (data.get("titles") or {}).items():
+        try:
+            titles[int(title_id)] = entry
+        except (TypeError, ValueError):
+            continue
+    return titles
+
+
+def update_token_backup(movies: List[Dict[str, Any]], backup_path: str) -> int:
+    """
+    カタログの token をバックアップ (tokens.json) に追記します。
+
+    一度でも配信されていた作品的信息は消さないので、配信終了してカタログから
+    消えた作品でもZIPが残っていれば後から復号できます。
+
+    Returns:
+        int: バックアップに保持されている作品数
+    """
+    existing: Dict[str, Dict[str, Any]] = {}
+    if os.path.exists(backup_path):
+        try:
+            with open(backup_path, "r", encoding="utf-8") as f:
+                existing = dict((json.load(f) or {}).get("titles") or {})
+        except (OSError, ValueError):
+            existing = {}
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    added = 0
+    for movie in movies:
+        title_id = movie.get("title_id")
+        token = movie.get("token")
+        if title_id is None or not token:
+            continue
+        key = str(title_id)
+        entry = existing.get(key)
+        if entry is None:
+            entry = {"first_seen": now}
+            added += 1
+        entry.update({
+            "token": int(token),
+            "name": movie.get("name"),
+            "lang_name": movie.get("lang_name"),
+            "contenttype": movie.get("contenttype"),
+            "voiceguide_version": movie.get("voiceguide_version"),
+            "subtitle_version": movie.get("subtitle_version"),
+            "last_seen": now,
+        })
+        existing[key] = entry
+
+    payload = {"version": 1, "updated": now, "titles": existing}
+    try:
+        tmp_path = backup_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=1, ensure_ascii=False, sort_keys=True)
+        os.replace(tmp_path, backup_path)
+    except OSError:
+        return len(existing)
+    return len(existing)
 
 
 def default_output_dir(zip_path: str) -> str:
@@ -238,7 +354,7 @@ def main() -> int:
         "Decrypt HELLOMovie subtitle / audio guide ZIP files."
     ))
     parser.add_argument("zips", nargs="+", help=tr(
-        "hellomovie_downloader.py で保存した ZIP (例: 1997_subtitles_v1.zip)",
+        "hellomovie_downloader.py で保存した ZIP (例: 1997_【映画名】_字幕_v1.zip)",
         "ZIP files saved by hellomovie_downloader.py (e.g. 1997_subtitles_v1.zip)"
     ))
     parser.add_argument("-o", "--output", help=tr(
@@ -263,20 +379,20 @@ def main() -> int:
     for zip_path in args.zips:
         token = args.token
         if token is None:
-            m = ZIP_NAME_RE.match(os.path.basename(zip_path))
+            title_id = zip_title_id(os.path.basename(zip_path))
             movies_path = args.movies or os.path.join(os.path.dirname(os.path.abspath(zip_path)), "movies.json")
-            if not m or not os.path.exists(movies_path):
+            if not title_id or not os.path.exists(movies_path):
                 logger.error(tr(
                     f"token を決められません: {zip_path} (--token か movies.json を指定してください)",
                     f"Cannot determine the token for {zip_path} (specify --token or provide movies.json)"
                 ))
                 all_ok = False
                 continue
-            token = load_tokens(movies_path).get(int(m.group(1)))
+            token = load_tokens(movies_path).get(title_id)
             if token is None:
                 logger.error(tr(
-                    f"movies.json に title_id {m.group(1)} がありません",
-                    f"title_id {m.group(1)} is not in movies.json"
+                    f"movies.json に title_id {title_id} がありません",
+                    f"title_id {title_id} is not in movies.json"
                 ))
                 all_ok = False
                 continue
