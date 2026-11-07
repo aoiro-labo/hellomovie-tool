@@ -187,34 +187,55 @@ def _features_of_chunk(movie: str, start: float, duration: float) -> tuple[int, 
 
 def build_db(movie: str, out: str, start: float = 0.0, duration: Optional[float] = None,
              chunk: float = 600.0, workers: int = 4, progress=None) -> None:
-    """参照音源から指紋 DB を作ります (区間を並列デコード)。
+    """参照音源から指紋 DB を作ります。
 
-    保存するのは帯エネルギーの列 (float16) です。量子化arks ではなく生の値を
-    持っておくと、照合の-DFT 相関で「参照にナレーションが混ざっている」ような
-    場合でも位置を推定できます。
+    **映像は 1 パスでデコードします。**
+    MPEG-TS (Blu-ray の m2ts) は PTS が 4184 秒ぶん後ろから始まることがあり、
+    `-ss` で中 sought するたびに先頭からそのぶんのデータを読み飛ばします。
+    区間ごとに並列デコードすると読み飛ばしが区間数だけ起きて O(n^2) になるため、
+    ここではまとめて 1 回デコードしてから特徴量を計算します
+    (38.6GB の Blu-ray でも 1 パス = ディスク速度Injector 約 10 分)。
     """
-    import concurrent.futures
-
     print(f"参照音源を解析しています: {movie}", flush=True)
     total = duration if duration else probe_duration(movie)
-    bounds = _chunk_bounds(max(total - start, 0.0), chunk)
-    print(f"  {total:.1f} 秒を {len(bounds)} 区間に分けて {workers} 並列で解析します", flush=True)
 
-    parts: list[tuple[int, np.ndarray]] = []
-    done = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_features_of_chunk, movie, start + s, d) for s, d in bounds]
-        for future in concurrent.futures.as_completed(futures):
-            offset, features = future.result()
-            parts.append((offset, features))
-            done += 1
+    # 1 パスでデコードしつつ、届いたぶんから順に特徴量を計算する
+    cmd = ["ffmpeg", "-v", "error"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", movie, "-vn", "-ac", "1", "-ar", str(SR)]
+    if duration:
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += ["-f", "s16le", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1 << 20)
+
+    parts: list[np.ndarray] = []
+    pending = bytearray()
+    read_bytes = 0
+    started = time.time()
+    try:
+        while True:
+            block = proc.stdout.read(1 << 20)
+            if not block:
+                break
+            pending.extend(block)
+            read_bytes += len(block)
+            # HOP サンプル単位に切り出して特徴量を計算
+            usable = (len(pending) // HOP) * HOP
+            if usable:
+                chunk_samples = np.frombuffer(bytes(pending[:usable]), dtype="<i2").astype(np.float32) / 32768.0
+                del pending[:usable]
+                features = band_features(chunk_samples)
+                if len(features):
+                    parts.append(features)
             if progress is not None:
-                progress(done, len(bounds))
-            print(f"  {done}/{len(bounds)} 区間完了", flush=True)
+                elapsed = max(time.time() - started, 1e-6)
+                progress(read_bytes / 2 / SR, total, elapsed)
+    finally:
+        proc.stdout.close()
+        proc.wait()
 
-    parts.sort(key=lambda item: item[0])
-    features = np.concatenate([item[1] for item in parts if len(item[1])], axis=0) if parts else \
-        np.zeros((0, NBANDS), dtype=np.float32)
+    features = np.concatenate(parts, axis=0) if parts else np.zeros((0, NBANDS), dtype=np.float32)
     payload = {"version": 3, "sr": SR, "frame": FRAME, "hop": HOP, "nbands": NBANDS,
                "start": start, "total": total,
                "features": features.astype(np.float16),

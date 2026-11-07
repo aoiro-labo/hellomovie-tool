@@ -181,8 +181,10 @@ class BuildDbWorker(threading.Thread):
             return
         self.events.put(("db_ready", str(self.out)))
 
-    def _progress(self, done: int, total: int) -> None:
-        self.events.put(("build_progress", (done, total)))
+    def _progress(self, done: float, total: float, elapsed: float) -> None:
+        speed = done / max(elapsed, 1e-6)
+        remain = (total - done) / max(speed, 1e-6)
+        self.events.put(("build_progress", (done, total, remain)))
 
 
 class SyncWorker(threading.Thread):
@@ -671,10 +673,10 @@ class GuideApp:
                 elif kind == "listening":
                     self.status.config(text=f"ブラウザの位置を待っています (http://127.0.0.1:{payload}/position)")
                 elif kind == "build_progress":
-                    done, total = payload
+                    done, total, remain = payload
                     self.progress["value"] = done
                     self.progress["maximum"] = max(total, 1)
-                    self.status.config(text=f"指紋 DB を作成しています... {done}/{total}")
+                    self.status.config(text=f"指紋 DB を作成しています... {int(done)}/{int(total)} 秒 (残り {int(remain)} 秒)")
                 elif kind == "db_ready":
                     self.progress["value"] = 0
                     pending = getattr(self, "_pending_fingerprint", None)
