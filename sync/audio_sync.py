@@ -51,9 +51,14 @@ NBANDS = 32       # 対数帯の数
 F_MIN = 200.0
 F_MAX = 4000.0
 QUANT_BITS = 4    # 帯エネルギーの量子化ビット数 (0..15)
-MAX_DISTANCE = 2  # 何個の帯が違えば「一致」とみなさないか
-MIN_VOTES = 8     # これ以下の得票は採用しない
-MIN_HITS = 8      # ヒットした窓数の下限 (無音などはこれ以下)
+# 判定の閾値。ファイルを直接読む場合は 2 でも十分ですが、
+# システム音 (ループバック) はサウンドカード側の処理 (ダウンミックス / EQ /
+# 空間効果など) を隔着するのでスペクトルが動き、距離が大きくなります。
+# そのため閾値を緩くし、得票の集中で判定します。
+MAX_DISTANCE = 12  # 何個の帯が違えば「一致」とみなさないか
+MIN_VOTES = 5       # これ以下の候補は採用しない
+MIN_HITS = 5        # ヒットした窓数の下限 (無音などはこれ以下)
+MIN_MARGIN = 2.0     # 最得票が 2 位の何倍である必要があるか
 
 # 16 進 1 桁あたりの popcount
 POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
@@ -70,6 +75,16 @@ def load_audio(path: str, start: float = 0.0, duration: Optional[float] = None) 
     if duration:
         cmd += ["-t", f"{duration:.3f}"]
     cmd += ["-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"]
+    out = subprocess.run(cmd, capture_output=True, check=True).stdout
+    return np.frombuffer(out, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def load_audio_fast(path: str, stream: Optional[int] = None) -> np.ndarray:
+    """音声トラックを丸ごとデコードします (LPCM なら最速)。"""
+    cmd = ["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"]
+    if stream is not None:
+        cmd = ["ffmpeg", "-v", "error", "-i", path, "-map", f"0:{stream}",
+               "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"]
     out = subprocess.run(cmd, capture_output=True, check=True).stdout
     return np.frombuffer(out, dtype="<i2").astype(np.float32) / 32768.0
 
@@ -130,26 +145,76 @@ def nibble_popcount(words: np.ndarray) -> np.ndarray:
 
 # ---------------------------------------------------------------- 指紋 DB
 
-def build_db(movie: str, out: str, start: float = 0.0, duration: Optional[float] = None) -> None:
-    """映画音声から指紋 DB を作ります。"""
-    cmd = ["ffmpeg", "-v", "error"]
-    if start:
-        cmd += ["-ss", f"{start:.3f}"]
-    cmd += ["-i", movie, "-vn", "-ac", "1", "-ar", str(SR)]
-    if duration:
-        cmd += ["-t", f"{duration:.3f}"]
-    cmd += ["-f", "s16le", "-"]
-    print(f"映画音声を解析しています: {movie}")
-    raw = subprocess.run(cmd, capture_output=True, check=True).stdout
-    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    total = len(samples) / SR
-    print(f"  {total:.1f} 秒を解析しました", flush=True)
+def probe_duration(path: str) -> float:
+    """FFmpeg で長さを取得します (秒)。"""
+    import shutil
 
-    packed = pack_nibbles(quantize(band_features(samples)))
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return 0.0
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", path], capture_output=True, check=True).stdout
+        return float(out.decode().strip())
+    except (subprocess.CalledProcessError, ValueError):
+        return 0.0
+
+
+def _chunk_bounds(total: float, chunk: float) -> list[tuple[float, float]]:
+    """並列デコード用の区間。
+
+    窓はフレーム格子 (HOP サンプル) に固定されているので、
+    区間の開始位置も格子に揃えておかないと時間がずれます。
+    """
+    frame_seconds = HOP / SR
+    bounds = []
+    position = 0.0
+    while position < total:
+        start = round(position / frame_seconds) * frame_seconds
+        end = min(position + chunk, total)
+        bounds.append((start, end - start))
+        position = end
+    return bounds
+
+
+def _features_of_chunk(movie: str, start: float, duration: float) -> tuple[int, np.ndarray]:
+    """1 区間の帯特徴量を計算します (並列実行用)。"""
+    samples = load_audio(movie, start=start, duration=duration)
+    features = band_features(samples)
+    return int(round(start * SR / HOP)), features
+
+
+def build_db(movie: str, out: str, start: float = 0.0, duration: Optional[float] = None,
+             chunk: float = 600.0, workers: int = 4, progress=None) -> None:
+    """映画音声から指紋 DB を作ります (区間を並列デコード)。"""
+    import concurrent.futures
+
+    print(f"映画音声を解析しています: {movie}", flush=True)
+    total = duration if duration else probe_duration(movie)
+    bounds = _chunk_bounds(max(total - start, 0.0), chunk)
+    print(f"  {total:.1f} 秒を {len(bounds)} 区間に分けて {workers} 並列で解析します", flush=True)
+
+    parts: list[tuple[int, np.ndarray]] = []
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_features_of_chunk, movie, start + s, d) for s, d in bounds]
+        for future in concurrent.futures.as_completed(futures):
+            offset, features = future.result()
+            parts.append((offset, features))
+            done += 1
+            if progress is not None:
+                progress(done, len(bounds))
+            print(f"  {done}/{len(bounds)} 区間完了", flush=True)
+
+    # 区間の順序を戻して連結する (フレームは独立なので境界の重複はない)
+    parts.sort(key=lambda item: item[0])
+    features = np.concatenate([item[1] for item in parts if len(item[1])], axis=0) if parts else \
+        np.zeros((0, NBANDS), dtype=np.float32)
+    packed = pack_nibbles(quantize(features))
     payload = {"version": 2, "sr": SR, "frame": FRAME, "hop": HOP, "nbands": NBANDS,
                "start": start, "total": total, "packed": packed}
     Path(out).write_bytes(pickle.dumps(payload, protocol=4))
-    print(f"完成: {out} ({len(packed):,} 窓, {Path(out).stat().st_size/1024/1024:.1f} MB)")
+    print(f"完成: {out} ({len(packed):,} 窓, {Path(out).stat().st_size/1024/1024:.1f} MB)", flush=True)
 
 
 def match_position(db: np.ndarray, live: np.ndarray) -> Tuple[Optional[float], int, int]:
@@ -178,6 +243,11 @@ def match_position(db: np.ndarray, live: np.ndarray) -> Tuple[Optional[float], i
     if not votes:
         return None, 0, hits
     best_offset, best_votes = max(votes.items(), key=lambda kv: kv[1])
+    others = [count for key, count in votes.items() if key != best_offset]
+    second = max(others) if others else 0
+    if best_votes < MIN_MARGIN * max(second, 1):
+        # 最得票が 2 位を分離できていないので採用しない
+        return None, best_votes, hits
     return best_offset / 2.0, best_votes, hits
 
 
@@ -200,32 +270,29 @@ class AudioSource:
         return self._read_live()
 
     def _read_live(self) -> np.ndarray:
+        """マイクまたはシステム音を取り込みます。
+
+        Windows のシステム音は WASAPI の loopback で取得します
+        (soundcard を使います。sounddevice の WASAPI は loopback に対応していません)。
+        """
         try:
-            import sounddevice as sd
+            import soundcard as sc
         except ImportError:
-            raise SystemExit("マイク/ループバック入力には sounddevice が必要です: pip install sounddevice")
+            raise SystemExit("マイク/ループバック入力には soundcard が必要です: pip install soundcard")
 
         if self.kind == "mic":
-            device = None
-            extra = None
-        else:  # loopback (Windows の既定出力デバイスをキャプチャ)
-            device = self._loopback_device()
-            extra = sd.WasapiSettings(exclusive=False)
+            device = sc.default_microphone()
+            label = "マイク"
+        else:  # loopback: 既定の出力デバイスの音をそのまま拾う
+            speaker = sc.default_speaker()
+            device = sc.get_microphone(speaker.id, include_loopback=True)
+            label = f"システム音 ({speaker.name})"
 
-        print(f"音声入力中 ({self.kind})... Ctrl+C で終了")
         frames = int(self.window * self.sr)
-        with sd.InputStream(device=device, samplerate=self.sr, channels=1, dtype="float32",
-                            blocksize=frames, extra_settings=extra) as stream:
-            data, _ = stream.read(frames)
+        print(f"音声入力中 ({label})... Ctrl+C で終了")
+        with device.recorder(samplerate=self.sr, channels=1) as recorder:
+            data = recorder.record(numframes=frames)
         return np.asarray(data, dtype=np.float32).reshape(-1)
-
-    @staticmethod
-    def _loopback_device():
-        import sounddevice as sd
-        for index, dev in enumerate(sd.query_devices()):
-            if dev.get("max_input_channels", 0) > 0 and "loopback" in dev.get("name", "").lower():
-                return index
-        return None
 
 
 # ---------------------------------------------------------------- ガイド再生

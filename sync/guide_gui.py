@@ -80,6 +80,55 @@ class TitleLibrary:
 
 # ---------------------------------------------------------------- 再生ワーカー
 
+class WaitingPlayer:
+    """待機音声 (waiting.ogg) を再生します。映像が始まったら止めます。"""
+
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+
+    def play(self, path: Path) -> bool:
+        self.stop()
+        mpv = find_mpv()
+        if mpv is None:
+            return False
+        self.proc = subprocess.Popen([mpv, "--no-config", "--no-terminal", str(path)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+            self.proc = None
+
+
+class BuildDbWorker(threading.Thread):
+    """指紋 DB を作ります (GUI が固まらないように別スレッドで)。"""
+
+    def __init__(self, movie: str, out: Path):
+        super().__init__(daemon=True)
+        self.movie = movie
+        self.out = out
+        self.events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+
+    def run(self) -> None:
+        try:
+            audio_sync.build_db(self.movie, str(self.out), progress=self._progress)
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("error", f"指紋 DB の作成に失敗しました: {exc}"))
+            return
+        self.events.put(("db_ready", str(self.out)))
+
+    def _progress(self, done: int, total: int) -> None:
+        self.events.put(("build_progress", (done, total)))
+
+
 class SyncWorker(threading.Thread):
     """映像とガイドを mpv で再生し、位置を追いかけます。"""
 
@@ -236,9 +285,12 @@ class GuideApp:
         self.library.load()
         self.worker: Optional[SyncWorker] = None
         self.fingerprint_worker: Optional[FingerprintWorker] = None
+        self.build_worker: Optional[BuildDbWorker] = None
+        self.waiting = WaitingPlayer()
         self.offset_file = Path(os.environ.get("TEMP", "/tmp")) / f"hmv-gui-offset-{os.getpid()}.txt"
         self.offset_file.write_text("0.000", encoding="utf-8")
         self.offset = 0.0
+        self._pending_fingerprint = None
 
         self._build()
         self._refresh_list()
@@ -301,8 +353,20 @@ class GuideApp:
         actions.pack(fill="x")
         ttk.Button(actions, text="待機音声を再生", command=self._play_waiting).pack(side="left")
         ttk.Button(actions, text="映像＋ガイドを再生", command=self._play_sync).pack(side="left", padx=6)
-        ttk.Button(actions, text="外部再生に同期 (音声認識)", command=self._play_fingerprint).pack(side="left")
+        ttk.Button(actions, text="自動同期 (音声認識)", command=self._play_fingerprint).pack(side="left")
         ttk.Button(actions, text="停止", command=self._stop_all).pack(side="left", padx=6)
+
+        ttk.Label(right, text="音声の入力元").pack(anchor="w", pady=(10, 0))
+        inputs = ttk.Frame(right)
+        inputs.pack(fill="x")
+        self.input_var = tk.StringVar(value="loopback")
+        ttk.Radiobutton(inputs, text="システム音 (ブラウザ・Netflix など)", variable=self.input_var,
+                        value="loopback").pack(side="left")
+        ttk.Radiobutton(inputs, text="マイク (劇場のスピーカー)", variable=self.input_var,
+                        value="mic").pack(side="left", padx=10)
+
+        self.progress = ttk.Progressbar(right, mode="determinate")
+        self.progress.pack(fill="x", pady=(8, 0))
 
         ttk.Label(right, text="調整").pack(anchor="w", pady=(12, 0))
         nudge = ttk.Frame(right)
@@ -412,12 +476,9 @@ class GuideApp:
         if not waiting.exists():
             messagebox.showinfo("注意", "この作品には待機音声がありません")
             return
-        mpv = find_mpv()
-        if mpv is None:
+        if not self.waiting.play(waiting):
             messagebox.showerror("エラー", "mpv が見つかりません")
             return
-        subprocess.Popen([mpv, "--no-config", "--no-terminal", str(waiting)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.status.config(text="待機音声を再生しています (上映開始まで)")
 
     def _play_sync(self) -> None:
@@ -430,14 +491,16 @@ class GuideApp:
             messagebox.showinfo("注意", "映像ファイルを選んでください")
             return
         self._stop_all()
+        self.waiting.stop()
         self.offset = 0.0
         self.offset_file.write_text("0.000", encoding="utf-8")
         guide_start = float(self.guide_start_var.get() or 0)
         self.worker = SyncWorker(movie, str(guide), guide_start, self.offset_file)
         self.worker.start()
-        self.status.config(text="再生を開始します...")
+        self.status.config(text="再生を開始します (映像を再生開始するとガイドが追従します)")
 
     def _play_fingerprint(self) -> None:
+        """外部再生 (Netflix など) 向け: 音を認識してガイドを自動で同期再生します。"""
         paths = self._guide_paths()
         if paths is None:
             return
@@ -447,19 +510,23 @@ class GuideApp:
             messagebox.showinfo("注意", "指紋 DB を作るために映像ファイルが必要です")
             return
         self._stop_all()
+        guide_start = float(self.guide_start_var.get() or 0)
+        source_kind = self.input_var.get()
+
         db = self.library.folder / f"fp_{Path(movie).stem}.pkl"
         if not db.exists():
             self.status.config(text="指紋 DB を作成しています (数分かかります)...")
-            self.root.update_idletasks()
-            try:
-                audio_sync.build_db(movie, str(db))
-            except Exception as exc:  # noqa: BLE001
-                messagebox.showerror("エラー", f"指紋 DB の作成に失敗しました: {exc}")
-                return
-        guide_start = float(self.guide_start_var.get() or 0)
-        self.fingerprint_worker = FingerprintWorker(db, str(guide), guide_start, "mic", None, 6.0, 2.0)
+            self.build_worker = BuildDbWorker(movie, db)
+            self.build_worker.start()
+            self._pending_fingerprint = (db, str(guide), guide_start, source_kind)
+            return
+
+        self._start_fingerprint(db, str(guide), guide_start, source_kind)
+
+    def _start_fingerprint(self, db: Path, guide: str, guide_start: float, source_kind: str) -> None:
+        self.fingerprint_worker = FingerprintWorker(db, guide, guide_start, source_kind, None, 6.0, 2.0)
         self.fingerprint_worker.start()
-        self.status.config(text="音を認識しています (マイク入力)...")
+        self.status.config(text=f"音を認識しています ({source_kind})... 再生開始を待っています")
 
     def _stop_all(self) -> None:
         if self.worker is not None:
@@ -468,6 +535,8 @@ class GuideApp:
         if self.fingerprint_worker is not None:
             self.fingerprint_worker.stop()
             self.fingerprint_worker = None
+        self.build_worker = None
+        self.waiting.stop()
         self.status.config(text="停止しました")
 
     def _nudge(self, delta: float) -> None:
@@ -481,7 +550,7 @@ class GuideApp:
     # -------------------------------------------------- イベント
 
     def _poll_events(self) -> None:
-        for worker in (self.worker, self.fingerprint_worker):
+        for worker in (self.build_worker, self.worker, self.fingerprint_worker):
             if worker is None:
                 continue
             while True:
@@ -497,10 +566,22 @@ class GuideApp:
                     ))
                 elif kind == "recognized":
                     position, target = payload
-                    self.status.config(text=f"認識: 映画内 {position:.1f} 秒 → ガイド {target:.1f} 秒")
+                    # _guide が始まったので待機音声は止める
+                    self.waiting.stop()
+                    self.status.config(text=f"認識: 映画内 {position:.1f} 秒 → ガイド {target:.1f} 秒 (自動同期中)")
                 elif kind == "searching":
                     votes, hits = payload
                     self.status.config(text=f"認識中... (得票 {votes} / ヒット {hits})")
+                elif kind == "build_progress":
+                    done, total = payload
+                    self.progress["value"] = done
+                    self.progress["maximum"] = max(total, 1)
+                    self.status.config(text=f"指紋 DB を作成しています... {done}/{total}")
+                elif kind == "db_ready":
+                    self.progress["value"] = 0
+                    pending = getattr(self, "_pending_fingerprint", None)
+                    if pending is not None:
+                        self._start_fingerprint(*pending)
                 elif kind == "error":
                     self.status.config(text=f"エラー: {payload}")
                 elif kind == "finished":

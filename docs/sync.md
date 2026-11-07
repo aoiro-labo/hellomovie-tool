@@ -1,7 +1,7 @@
 # 音声ガイドと映像の同期
 
 HELLO! MOVIE の音声ガイド (コメンタリー) を、Blu-ray や Netflix の映像と同期させるためのツール群です。
-`sync/hellomovie_sync.py` と `sync/audio_sync.py` があります。
+`sync/hellomovie_sync.py` と `sync/audio_sync.py`、`sync/guide_gui.py` があります。
 
 ---
 
@@ -11,14 +11,14 @@ Android アプリ (v3.3.0) の `libsapkit.so` と jadx 展開結果を調べた�
 
 | 段階 | 実装 |
 |---|---|
-| 入力 | マイク ( theaters 環境 ) |
+| 入力 | マイク (劇場の環境) |
 | 特徴量 | native の `evxfp` 名前空間。`EVXFPFrameCreator::calcFPFrame` / `calcIndexFP` が指紋フレームとインデックス指紋を作る |
 | 照合 | `EVXFPRecognizerMain::calcMatchRate` / `calcMatchRateMaxOfSubframes`。DB は `db/packed.db` と `db/packed2.db` |
 | DB の復号 | `evxfp::apiKeyManager::DecryptBinary` (AES128)。`updateFPRecognizer` に 2 本の base64 鍵を渡している |
 | 判定 | 一致率が `type2_threshold` (作品ごとに 57〜65) 以上、`type2_patterns` (3) 個一致で確定。タイムアウトは `recog_timeout` (1800 秒) |
 | 位置合わせ | 確定後は `updateTimeParameter(...)` / `changedPlayTime()` でガイドの再生位置を追い続ける |
 
-つまり公式は「**今流れている音を指紋照合して、作品のどの位置ににいるか**」を推定し、
+つまり公式は「**今流れている音を指紋照合して、作品のどの位置にいるか**」を推定し、
 ガイドの再生位置をそれに合わせています。
 
 ただし `packed.db` は AES128 で暗号化、素直な実装では読みません。
@@ -47,7 +47,7 @@ python sync/hellomovie_sync.py play --guide nf_guide.ogg --guide-start 10
 * `mpv` が無い場合は `ffplay` で簡易再生 (位置補正は不可) にフォールバックします
 
 実測: 60 秒のクリップで、ガイドと映像のずれは **30〜60 ミリ秒** に収まりました
-(音声出力のレイテンシ分だけGuide が遅れるので、補正の閾値は 0.25 秒)。
+(音声出力のレイテンシ分だけガイドが遅れるので、補正の閾値は 0.25 秒)。
 
 #### メモ: mpv の IPC は Windows では名前付きパイプ
 
@@ -75,18 +75,43 @@ python sync/hellomovie_sync.py scan --reference Netflix.mkv --target BD.m2ts
 「今流れている音」を認識して、ガイドを同期再生します。公式と同じく指紋照合方式です。
 
 ```bash
-# 1) 手元の映画から指紋 DB を作る
+# 1) 手元の映画から指紋 DB を作る (区間を並列デコードするので速い)
 python sync/audio_sync.py build --movie "E:\ビデオ\...\00001.m2ts" --out fp_movie.pkl
 
-# 2) マイク / システム音声を認識してガイドを同期再生
-python sync/audio_sync.py watch --db fp_movie.pkl --guide sound.ogg --input mic
+# 2) システム音 / マイクを認識してガイドを同期再生
 python sync/audio_sync.py watch --db fp_movie.pkl --guide sound.ogg --input loopback
+python sync/audio_sync.py watch --db fp_movie.pkl --guide sound.ogg --input mic
 ```
 
 * 照合方式: 対数帯 32 本のエネルギーを 4 bit に量子化し、ビット演算でハミング距離を比較 (AudFPrint と同じ考え方)
 * 窓は 32 ms hop、6 秒分を一括照合して得票の最頻位置を推定します
-* 検証済みの精度: Netflix ローカルの 600 秒 / 120 秒 / 800 秒 / 500 秒 の各 6 秒を投入して **いずれも誤差 0.0 秒** で一致
+* 判定は「最得票が 2 位を分離できているか」で行います (拮抗していれば採用しません)
+* ファイル読み込み時の精度: Netflix ローカルの 600 / 120 / 800 / 500 秒の各 6 秒を投入して **いずれも誤差 0.0 秒** で一致
+* システム音 (ループバック) 経由: 実際に映画を鳴らして拾い、**300 秒 → 303.0 秒 / 600 秒 → 603.0 秒** で一致
+  (キャプチャ開始が再生開始の 3 秒後だったため就是这个値)
 * 無音区間 (冒頭直後のロゴ) は得票が閾値未満になり、誤検出しません
+
+#### システム音の取り方
+
+Windows のシステム音は **WASAPI の loopback** で取得します。
+
+* `sounddevice` の WASAPI は loopback に対応していないので `soundcard` を使います
+* ブラウザの Netflix であれば、そのままその音を拾えます
+
+```bash
+pip install soundcard
+```
+
+#### 判定が緩い理由
+
+システム音はサウンドカード側の処理 (ダウンミックス / EQ / 空間効果など) を隔着するので、
+ファイルから直接取り込んだ音とはスペクトルが変わります。
+そのため一致の閾値 (`MAX_DISTANCE`) を 12 に緩め、得票の集中と 2 位との差で判断しています。
+
+| 入力 | 最小距離の中央値 | 使う閾値 |
+|---|---|---|
+| ファイル (直接) | 0〜2 | 2 でも十分 |
+| システム音 (loopback) | 13〜17 | 12 |
 
 ### 補助コマンド
 
@@ -105,7 +130,7 @@ python sync/guide_gui.py
 2. 「待機音声を再生」で上映開始前の `waiting.ogg` を流す
 3. 映像が始まったら
    * 「映像＋ガイドを再生」 → 手元の映像ファイルなら位置ベースで自動同期
-   * 「外部再生に同期 (音声認識)」 → Netflix など外部再生なら、マイク入力から位置を推定してガイドを同期
+   * 「自動同期 (音声認識)」 → Netflix など外部再生なら、音を認識して自動でガイドが追従
 4. ずれたときは「調整」ボタン (±0.1 / ±0.5 / ±5 秒 / リセット)
 
 作品一覧は `tokens.json` から読むので、**配信終了してカタログから消えた作品も選べます**。
@@ -147,13 +172,13 @@ python sync/guide_gui.py
 | play (mpv) | mpv, ffmpeg |
 | play (ffplay) | ffmpeg (ffplay) |
 | guide_gui | mpv (同期再生する場合), ffmpeg |
-| audio_sync build/watch | numpy, ffmpeg、マイク入力は sounddevice |
+| audio_sync build/watch | numpy, ffmpeg、系统音なら soundcard |
 | mux / export | ffmpeg (libopus) |
 
 ```bash
 pip install numpy
-# マイク / ループバックを使う場合
-pip install sounddevice
+# システム音 (ループバック) を使う場合
+pip install soundcard
 ```
 
 mpv は [mpv.io](https://mpv.io/) の Windows ビルド (`winget install shinchiro.mpv`) が
