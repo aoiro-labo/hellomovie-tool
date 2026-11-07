@@ -3,6 +3,16 @@
 対象: [tsukumijima/hlmv-dl](https://github.com/tsukumijima/hlmv-dl) `master` (`160ef7d`, 2026-11-04)
 検証日: 2026-11-06
 
+> **2026-11-06 追記**
+>
+> この文書で提案した 3 件の修正は **PR #1 としてマージされました** (merge commit `fc5c609`)。
+> 続けて、保存済みパッケージから音声を復元する `--decode` を **PR #2 で追加**しました
+> (merge commit `a659746`、維持者から「LGTM!」)。
+>
+> つまりカタログ耐性 / Opus 検証 / 403 リトライ / 保存済みパッケージの再復号は
+> 上流に反映済みです。**残っている主な差分は字幕対応と token のバックアップ**です。
+> 字幕対応は差分が大きいため upstream には提案せず、本リポジトリのみで実装しています。
+
 ## 検証方法
 
 1. リポジトリを clone し、`hlmv_dl/__init__.py` の `decode_audio` をそのまま実行
@@ -139,12 +149,14 @@ if waiting_path.exists() is True:   # ← ZIP を全部落とした後
 
 ## 本リポジトリでの対応
 
-| 項目 | 対応 |
-|---|---|
-| 字幕 | `hellomovie_decrypt.py` で PNG 復号に対応 |
-| カタログ欠損 | `movies.json` を `.get()` ベースで処理し、欠損しても継続 |
-| Ogg 検証 | ページ CRC まで検証 (`is_valid_ogg`) |
-| 403 | `download_file` / `fetch_movies_list` で再認証して 1 回リトライ |
-| ZIP パス | 正規表現で `*/png/<n>.dat` / `*/data/(sound|waiting).dat` を探す |
-| 待機音声 | ZIP を丸ごと保存する設計のため該当なし |
-| ファイル名 | 出力名が `<title_id>_...` 固定のため予約名の影響なし |
+| 項目 | 対応 | 上流 |
+|---|---|---|
+| 字幕 | `hellomovie_decrypt.py` で PNG 復号に対応 | 未対応 (差分が大きいため本リポジトリのみ) |
+| カタログ欠損 | `movies.json` を `.get()` ベースで処理し、欠損しても継続 | ✅ PR #1 で反映 |
+| Ogg 検証 | ページ CRC まで検証 (`is_valid_ogg`) | ✅ PR #1 で反映 |
+| 403 | `download_file` / `fetch_movies_list` で再認証して 1 回リトライ | ✅ PR #1 で反映 |
+| 保存済みパッケージの再復号 | `tools/recover_token.py` で token を総当たり復旧 | ✅ PR #2 (`--decode`) で反映 |
+| token のバックアップ | `tokens.json` に一度でも掲載された	token を蓄積 | 未対応 (hlmv-dl は `--keep-package` の `.info.json` に token を保存) |
+| ZIP パス | 正規表現で `*/png/<n>.dat` / `*/data/(sound|waiting).dat` を探す | 該当なし |
+| 待機音声 | ZIP を丸ごと保存する設計のため該当なし | 該当なし |
+| ファイル名 | `<title_id>_<作品名>_<種別>_v<n>` 形式 (使用禁止文字は `_` に置換) | `<name> [<id>]` 形式 |

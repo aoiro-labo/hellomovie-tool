@@ -41,10 +41,23 @@ python sync/hellomovie_sync.py play --guide nf_guide.ogg --guide-start 10
 ```
 
 * `mpv` の IPC で映像の再生位置を 0.25 秒ごとに取得し、ガイドの位置を追い込みます (ドリフト自動補正)
-* 一時停止 / シークはガイドにも伝えます
+* 一時停止 / シークはガイドにも伝えます。映像が終わればガイドも止まります
 * ずれたときは映像側でホットキー: `Shift+←/→` ±5 秒 / `Alt+←/→` ±0.5 秒 / `Ctrl+←/→` ±0.1 秒 / `Ctrl+0` でリセット
 * 補正値は `hellomovie_downloads/sync_offsets.json` に保存され、次回 `--auto` で自動適用されます
 * `mpv` が無い場合は `ffplay` で簡易再生 (位置補正は不可) にフォールバックします
+
+実測: 60 秒のクリップで、ガイドと映像のずれは **30〜60 ミリ秒** に収まりました
+(音声出力のレイテンシ分だけGuide が遅れるので、補正の閾値は 0.25 秒)。
+
+#### メモ: mpv の IPC は Windows では名前付きパイプ
+
+mpv の `--input-ipc-server` は **Windows では TCP ではなく名前付きパイプ**
+(`\\.\pipe\<name>`) を使います。Unix ではソケットファイルです。
+本ツールは `sync/hellomovie_sync.py` の `MpvClient` が両方に対応しています。
+
+また、この mpv ビルドの Lua には `mp.add_property` が無いので、
+`guide_nudge.lua` は補正値を **ファイル** (`--script-opts=guide_nudge-offset_file=...`) に
+書き出し、Python 側がそれを読み取る方式にしています。
 
 ### 2. 2つの映像のオフセットを自動測定 — `hellomovie_sync.py scan`
 
@@ -79,6 +92,23 @@ python sync/audio_sync.py watch --db fp_movie.pkl --guide sound.ogg --input loop
 
 * `export` : ガイドの先頭を何秒か切って、ブラウザで再生しやすいファイルを作ります (Netflix 用)
 * `mux` : 映像にガイドを音声トラックとして埋め込みます。**Blu-ray (40GB 超) では出力も同サイズになるので非推奨**
+
+### 0. GUI — `sync/guide_gui.py`
+
+公式アプリと同じ操作順のミニアプリです (Tkinter のみ、標準ライブラリ)。
+
+```bash
+python sync/guide_gui.py
+```
+
+1. 左のリストから作品を選ぶ (検索可 / 「カタログを更新」で最新の作品一覧を取得)
+2. 「待機音声を再生」で上映開始前の `waiting.ogg` を流す
+3. 映像が始まったら
+   * 「映像＋ガイドを再生」 → 手元の映像ファイルなら位置ベースで自動同期
+   * 「外部再生に同期 (音声認識)」 → Netflix など外部再生なら、マイク入力から位置を推定してガイドを同期
+4. ずれたときは「調整」ボタン (±0.1 / ±0.5 / ±5 秒 / リセット)
+
+作品一覧は `tokens.json` から読むので、**配信終了してカタログから消えた作品も選べます**。
 
 ---
 
@@ -116,6 +146,7 @@ python sync/audio_sync.py watch --db fp_movie.pkl --guide sound.ogg --input loop
 | scan | numpy, ffmpeg |
 | play (mpv) | mpv, ffmpeg |
 | play (ffplay) | ffmpeg (ffplay) |
+| guide_gui | mpv (同期再生する場合), ffmpeg |
 | audio_sync build/watch | numpy, ffmpeg、マイク入力は sounddevice |
 | mux / export | ffmpeg (libopus) |
 
@@ -124,3 +155,7 @@ pip install numpy
 # マイク / ループバックを使う場合
 pip install sounddevice
 ```
+
+mpv は [mpv.io](https://mpv.io/) の Windows ビルド (`winget install shinchiro.mpv`) が
+そのまま使えます。PATH に無くても `C:\Program Files\MPV Player\mpv.exe` を
+自動で探します。

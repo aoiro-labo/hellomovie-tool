@@ -179,8 +179,12 @@ python tools/recover_token.py --zip hellomovie_downloads/2144_voiceguide_v1.zip
 ## 音声ガイドと映像の同期
 
 音声ガイド (コメンタリー) を Blu-ray や Netflix の映像に同期させるツール群です。
+GUI 付き。公式アプリと同じ操作順です。
 
 ```bash
+# GUI (作品選択 → 待機音声 → 映像開始で自動同期)
+python sync/guide_gui.py
+
 # 映像とガイドを同時に再生 (mpv の IPC でドリフトを自動補正)
 python sync/hellomovie_sync.py play --movie "E:\ビデオ\...\00001.m2ts" --guide sound.ogg
 
@@ -191,6 +195,9 @@ python sync/hellomovie_sync.py scan --reference Netflix.mkv --target BD.m2ts
 python sync/audio_sync.py build --movie "E:\ビデオ\...\00001.m2ts" --out fp.pkl
 python sync/audio_sync.py watch --db fp.pkl --guide sound.ogg --input loopback
 ```
+
+mpv があれば位置ベースの同期再生ができます
+(`winget install shinchiro.mpv`、PATH に無くても `C:\Program Files\MPV Player\mpv.exe` を自動探索します)。
 
 詳しい仕組みと実測値は [docs/sync.md](docs/sync.md) にまとめています。
 

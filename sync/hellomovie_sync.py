@@ -33,6 +33,7 @@ EVXAudioManagerCPP.updateFPRecognizer)、ガイド音声はコメンタリーの
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import shutil
@@ -63,6 +64,25 @@ def find_ffprobe() -> str:
     if exe is None:
         sys.exit("ffprobe が見つかりません。")
     return exe
+
+
+# Windows で mpv をインストールした先去 (PATH に入っていないことがある)
+MPV_FALLBACK_PATHS = [
+    r"C:\Program Files\MPV Player\mpv.exe",
+    r"C:\Program Files\mpv\mpv.exe",
+    r"C:\Program Files (x86)\mpv\mpv.exe",
+]
+
+
+def find_mpv() -> Optional[str]:
+    """mpv の実行ファイルを探します (PATH に無い場合は既知のインストール先も)。"""
+    exe = shutil.which("mpv")
+    if exe is not None:
+        return exe
+    for candidate in MPV_FALLBACK_PATHS:
+        if Path(candidate).exists():
+            return candidate
+    return None
 
 
 def pick_audio_stream(path: str, prefer_ja: bool = True) -> int:
@@ -210,16 +230,16 @@ OFFSETS_FILE_NAME = "sync_offsets.json"
 
 
 class MpvClient:
-    """mpv の IPC (JSON over TCP) を操作する小さなクライアント。"""
+    """mpv の IPC (JSON over 名前付きパイプ / Unix ソケット) を操作する小さなクライアント。"""
 
-    def __init__(self, proc: subprocess.Popen, sock: socket.socket):
+    def __init__(self, proc: subprocess.Popen, stream):
         self.proc = proc
-        self.sock = sock
+        self.stream = stream
         self.buf = b""
 
     def command(self, cmd: list[Any]) -> Any:
         payload = json.dumps({"command": cmd}) + "\n"
-        self.sock.sendall(payload.encode("utf-8"))
+        self.stream.sendall(payload.encode("utf-8"))
         return self._read()
 
     def set_property(self, name: str, value: Any) -> Any:
@@ -232,59 +252,106 @@ class MpvClient:
         return None
 
     def _read(self) -> Any:
-        while b"\n" not in self.buf:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                return None
-            self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        try:
-            return json.loads(line.decode("utf-8"))
-        except ValueError:
-            return None
+        # mpv は応答のほかにイベント (client-message など) も送ってくるので、
+        # 応答 (request_id を持つもの) が出るまで読み飛ばす。
+        while True:
+            while b"\n" not in self.buf:
+                chunk = self.stream.recv(65536)
+                if not chunk:
+                    return None
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            try:
+                message = json.loads(line.decode("utf-8"))
+            except ValueError:
+                continue
+            if isinstance(message, dict) and "event" in message:
+                continue
+            return message
 
     def close(self) -> None:
+        # "quit" の応答は mpv が終了する Ning 返ってこないので、待たずに terminate する
         try:
-            self.command(["quit"])
-        except OSError:
-            pass
-        try:
-            self.sock.close()
+            self.stream.sendall(b'{"command":["quit"]}\n')
         except OSError:
             pass
         try:
             self.proc.terminate()
+            self.proc.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        try:
+            self.stream.close()
         except OSError:
             pass
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+class _PipeStream:
+    """Windows の名前付きパイプを mpv の IPC と同じ interface で扱う薄いラッパ。"""
+
+    def __init__(self, path: str):
+        self.file = open(path, "r+b", buffering=0)
+
+    def sendall(self, data: bytes) -> None:
+        self.file.write(data)
+        self.file.flush()
+
+    def recv(self, size: int) -> bytes:
+        return self.file.read(size) or b""
+
+    def close(self) -> None:
+        self.file.close()
 
 
-def _start_mpv(port: int, media: str, extra: list[str]) -> Optional[MpvClient]:
-    mpv = shutil.which("mpv")
-    if mpv is None:
-        return None
-    cmd = [mpv, "--no-terminal", "--no-config", "--idle=yes",
-           f"--input-ipc-server=127.0.0.1:{port}", media] + extra
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    sock = socket.socket()
-    sock.settimeout(10)
-    deadline = time.time() + 10
+_IPC_COUNTER = itertools.count()
+
+
+def _ipc_address(tag: str) -> str:
+    """mpv の IPC サーバアドレスを返します。
+
+    Windows では名前付きパイプ、Unix ではソケットファイルを使います
+    (mpv の --input-ipc-server は Windows では名前付きパイプのみ対応)。
+    """
+    unique = f"hmv-{tag}-{os.getpid()}-{next(_IPC_COUNTER)}"
+    if os.name == "nt":
+        return rf"\\.\pipe\{unique}"
+    return f"/tmp/{unique}.sock"
+
+
+def _connect_ipc(address: str, proc: subprocess.Popen) -> Any:
+    deadline = time.time() + 15
     while time.time() < deadline:
         try:
-            sock.connect(("127.0.0.1", port))
+            if os.name == "nt":
+                return _PipeStream(address)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(1.0)
-            return MpvClient(proc, sock)
+            sock.connect(address)
+            return sock
         except OSError:
             if proc.poll() is not None:
                 break
             time.sleep(0.2)
-    proc.terminate()
-    return None
+    raise RuntimeError(f"mpv の IPC に接続できませんでした: {address}")
+
+
+def _start_mpv(tag: str, media: str, extra: list[str]) -> Optional[MpvClient]:
+    mpv = find_mpv()
+    if mpv is None:
+        return None
+    address = _ipc_address(tag)
+    cmd = [mpv, "--no-terminal", "--no-config", "--idle=yes",
+           f"--input-ipc-server={address}", media] + extra
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        stream = _connect_ipc(address, proc)
+    except RuntimeError:
+        proc.terminate()
+        return None
+    return MpvClient(proc, stream)
 
 
 def _offsets_path(args) -> Path:
@@ -357,15 +424,18 @@ def cmd_play(args) -> int:
 
     movie_client = None
     guide_client = None
+    offset_file = Path(tempfile.gettempdir()) / f"hmv-guide-offset-{os.getpid()}.txt"
+    offset_file.write_text("0.000", encoding="utf-8")
     if args.movie:
-        movie_port = _free_port()
         lua = Path(__file__).resolve().parent / "guide_nudge.lua"
         extra = ["--pause=yes"]
+        if args.no_video_output:
+            extra.append("--vo=null")
         if lua.exists():
             extra.append(f"--script={lua}")
-        movie_client = _start_mpv(movie_port, args.movie, extra)
-    guide_port = _free_port()
-    guide_client = _start_mpv(guide_port, guide, [
+            extra.append(f"--script-opts=guide_nudge-offset_file={offset_file}")
+        movie_client = _start_mpv("movie", args.movie, extra)
+    guide_client = _start_mpv("guide", guide, [
         "--pause=yes", "--audio-display=no", "--no-video",
         f"--start={guide_start:.3f}", "--keep-open=no",
     ])
@@ -390,20 +460,24 @@ def cmd_play(args) -> int:
             guide_time = guide_client.get_property("time-pos")
             paused = movie_client.get_property("pause")
             if paused is None or movie_time is None:
+                # 映像が終わった (または閉じた) のでガイドも止める
                 break
             if guide_time is None:
-                time.sleep(0.2)
-                continue
+                # ガイドが最後まで再生された
+                break
 
             if paused:
                 guide_client.set_property("pause", True)
             else:
                 guide_client.set_property("pause", False)
 
-            # ホットキーによる補正値が변했たら即座に追い直す
-            offset = movie_client.get_property("guide-offset")
-            if isinstance(offset, (int, float)) and abs(offset - last_offset) > 1e-6:
-                last_offset = float(offset)
+            # ホットキー (guide_nudge.lua) が書き出した補正値的变化を反映する
+            try:
+                offset = float(offset_file.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                offset = last_offset
+            if abs(offset - last_offset) > 1e-6:
+                last_offset = offset
                 guide_start = args.guide_start + last_offset
                 guide_client.command(["seek", float(movie_time) + guide_start, "absolute+exact"])
                 print(f"  補正 {last_offset:+.2f}s を適用 (ガイド位置 {guide_start:.2f}s)", flush=True)
@@ -502,8 +576,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     pl.add_argument("--countdown", type=float, default=0.0, help="開始前にカウントダウンする秒数")
     pl.add_argument("--auto", action="store_true", help="保存済みの補正値を自動的に適用する")
     pl.add_argument("--offsets-file", default=None, help="補正値の保存先 (既定: hellomovie_downloads/sync_offsets.json)")
-    pl.add_argument("--max-drift", type=float, default=0.25, help="これ以上ずれたらガイドを追い correcting")
+    pl.add_argument("--max-drift", type=float, default=0.25, help="これ以上ずれたらガイドを追い corrective")
     pl.add_argument("--interval", type=float, default=0.25, help="位置を確認・補正する間隔 (秒)")
+    pl.add_argument("--no-video-output", action="store_true", help="映像を出力しない (動作確認用)")
     pl.set_defaults(func=cmd_play)
 
     m = sub.add_parser("mux", help="映像にガイドを合成して1ファイルにする (容量を食うので小容量向け)")

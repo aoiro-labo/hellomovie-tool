@@ -50,7 +50,7 @@ HOP = 512         # 32 ms  hop
 NBANDS = 32       # 対数帯の数
 F_MIN = 200.0
 F_MAX = 4000.0
-QUANT_BITS = 4    # 帯エネルギー���量子化ビット数 (0..15)
+QUANT_BITS = 4    # 帯エネルギーの量子化ビット数 (0..15)
 MAX_DISTANCE = 2  # 何個の帯が違えば「一致」とみなさないか
 MIN_VOTES = 8     # これ以下の得票は採用しない
 MIN_HITS = 8      # ヒットした窓数の下限 (無音などはこれ以下)
@@ -233,9 +233,15 @@ class AudioSource:
 def play_guide_from(guide: str, position: float, player: str = "mpv") -> Optional[subprocess.Popen]:
     """ガイドを指定位置から再生します。"""
     import shutil
-    if player == "mpv" and shutil.which("mpv"):
+    mpv = shutil.which("mpv")
+    if mpv is None:
+        for candidate in (r"C:\Program Files\MPV Player\mpv.exe", r"C:\Program Files\mpv\mpv.exe"):
+            if Path(candidate).exists():
+                mpv = candidate
+                break
+    if player == "mpv" and mpv is not None:
         return subprocess.Popen([
-            "mpv", "--no-terminal", "--no-config", "--audio-display=no", "--no-video",
+            mpv, "--no-terminal", "--no-config", "--audio-display=no", "--no-video",
             f"--start={max(position, 0.0):.3f}", guide,
         ])
     ffplay = shutil.which("ffplay")
