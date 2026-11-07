@@ -41,7 +41,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
@@ -499,6 +501,108 @@ def cmd_play(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- ブラウザ位置
+
+class PositionReceiver:
+    """ブラウザ拡張 (Firefox) からの再生位置を受け取る HTTP サーバ。
+
+    拡張 (sync/firefox_position) が <video> の currentTime を 0.5 秒ごとに
+    POST してきます。指紋照合が不要なので、DB を作る必要がありません。
+    """
+
+    def __init__(self, port: int = 8765):
+        self.port = port
+        self._state: Optional[dict] = None
+        self._lock = threading.Lock()
+        receiver = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else b"{}"
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except ValueError:
+                    payload = {}
+                receiver.update(payload)
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+            def do_OPTIONS(self) -> None:  # noqa: N802
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+            def log_message(self, *args) -> None:
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+    def start(self) -> None:
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self) -> None:
+        try:
+            self.server.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def update(self, payload: dict) -> None:
+        with self._lock:
+            self._state = payload
+
+    def latest(self) -> Optional[dict]:
+        with self._lock:
+            return self._state
+
+
+def cmd_position(args) -> int:
+    """ブラウザの再生位置に合わせてガイドを再生します (指紋 DB 不要)。"""
+    receiver = PositionReceiver(args.port)
+    receiver.start()
+    print(f"ブラウザの位置を待っています (http://127.0.0.1:{args.port}/position)")
+    print("  Firefox 拡張 sync/firefox_position を読み込んでください")
+    print("  (about:debugging → This Firefox → Load Temporary Add-on… → manifest.json)")
+
+    guide_client = _start_mpv("guide", args.guide, [
+        "--pause=yes", "--audio-display=no", "--no-video",
+        f"--start={args.guide_start:.3f}", "--keep-open=no",
+    ])
+    if guide_client is None:
+        sys.exit("mpv を起動できませんでした。")
+    print("  再生を開始したら spontaneously ガイドが追従します\n")
+
+    last = None
+    try:
+        while True:
+            state = receiver.latest()
+            if state is None:
+                time.sleep(0.2)
+                continue
+            position = float(state.get("currentTime") or 0)
+            paused = bool(state.get("paused"))
+            target = position + args.guide_start
+            guide_time = guide_client.get_property("time-pos")
+            if paused:
+                guide_client.set_property("pause", True)
+            else:
+                guide_client.set_property("pause", False)
+                if guide_time is None or abs(float(guide_time) - target) > 1.0:
+                    guide_client.command(["seek", target, "absolute+exact"])
+            if last is None or abs(last - target) > 0.2:
+                last = target
+                title = (state.get("title") or "")[:40]
+                print(f"  位置 {target:8.1f}s  ガイド {title}", flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\n停止します。")
+    finally:
+        guide_client.close()
+        receiver.stop()
+    return 0
+
+
 # ---------------------------------------------------------------- mux / export
 
 def cmd_mux(args) -> int:
@@ -580,6 +684,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     pl.add_argument("--interval", type=float, default=0.25, help="位置を確認・補正する間隔 (秒)")
     pl.add_argument("--no-video-output", action="store_true", help="映像を出力しない (動作確認用)")
     pl.set_defaults(func=cmd_play)
+
+    po = sub.add_parser("position", help="ブラウザの再生位置に合わせてガイドを再生する (指紋 DB 不要)")
+    po.add_argument("--guide", required=True, help="ガイドの sound.ogg")
+    po.add_argument("--guide-start", type=float, default=0.0,
+                    help="映像の 0:00 にガイドの何秒目が来るか (BD: 0 / Netflix: 10)")
+    po.add_argument("--port", type=int, default=8765, help="位置を受け取るポート")
+    po.add_argument("--interval", type=float, default=0.25, help="位置を確認・追従する間隔 (秒)")
+    po.set_defaults(func=cmd_position)
 
     m = sub.add_parser("mux", help="映像にガイドを合成して1ファイルにする (容量を食うので小容量向け)")
     m.add_argument("--movie", required=True, help="映像ファイル (BD m2ts / MKV など)")

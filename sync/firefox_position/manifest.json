@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "HELLO! MOVIE 再生位置レポー��",
+  "version": "1.0",
+  "description": "再生中の動画の位置を localhost に通知します (音声ガイド同期用)",
+  "permissions": ["tabs", "scripting", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

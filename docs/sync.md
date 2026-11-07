@@ -152,9 +152,34 @@ python sync/guide_gui.py
 3. 映像が始まったら
    * 「映像＋ガイドを再生」 → 手元の映像ファイルなら位置ベースで自動同期
    * 「自動同期 (音声認識)」 → Netflix など外部再生なら、音を認識して自動でガイドが追従
+   * 「ブラウザの位置で同期」 → Firefox 拡張の再生位置を直接使う (指紋 DB 不要)
 4. ずれたときは「調整」ボタン (±0.1 / ±0.5 / ±5 秒 / リセット)
 
 作品一覧は `tokens.json` から読むので、**配信終了してカタログから消えた作品も選べます**。
+
+### 0.5. ブラウザの位置を直接使う (指紋 DB 不要)
+
+ブラウザで再生するなら、**再生中の動画の位置を直接 읽으면** 指紋照合など必要ありません。
+`sync/firefox_position/` に小さな Firefox 拡張打进ので、<video> の `currentTime` を
+0.5 秒ごとに localhost に送ります。
+
+1. Firefox で `about:debugging#/runtime/this-firefox` を開く
+2. 「Load Temporary Add-on…」( temporarily add-on を読み込む) を押して
+   `sync/firefox_position/manifest.json` を選ぶ
+3.  GUIDE: `python sync/hellomovie_sync.py position --guide sound.ogg --guide-start 10`
+   (GUI なら「ブラウザの位置で同期」ボタン)
+4. Netflix などで再生を始めると、ガイドが常に動画の位置に追従します
+   (一時停止・シークも反映されます)
+
+CLI だけを使う場合:
+
+```bash
+python sync/hellomovie_sync.py position --guide sound.ogg --guide-start 10
+# ブラウザの 0:00 がガイドの 10 秒目に対応します (BD = Netflix + 10s のため)
+```
+
+受信は `http://127.0.0.1:8765/position` 宛てです。拡張は一時読み込みなので
+Firefox を再起動すると消えます (GUIDE: `about:debugging` から読み直す)。
 
 ---
 

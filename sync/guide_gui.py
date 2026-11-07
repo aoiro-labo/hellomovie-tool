@@ -30,7 +30,7 @@ from typing import Any, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audio_sync  # noqa: E402
-from hellomovie_sync import MpvClient, _start_mpv, find_mpv  # noqa: E402
+from hellomovie_sync import MpvClient, PositionReceiver, _start_mpv, find_mpv  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DOWNLOADS = ROOT / "hellomovie_downloads"
@@ -106,6 +106,62 @@ class WaitingPlayer:
                 except OSError:
                     pass
             self.proc = None
+
+
+class PositionWorker(threading.Thread):
+    """ブラウザ (Firefox 拡張) から受け取った再生位置に合わせてガイドを再生します。"""
+
+    def __init__(self, guide: str, guide_start: float, port: int = 8765, interval: float = 0.25):
+        super().__init__(daemon=True)
+        self.guide = guide
+        self.guide_start = guide_start
+        self.port = port
+        self.interval = interval
+        self.events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        self.receiver: Optional[PositionReceiver] = None
+        self.guide_client: Optional[MpvClient] = None
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.receiver is not None:
+            self.receiver.stop()
+        if self.guide_client is not None:
+            self.guide_client.close()
+
+    def run(self) -> None:
+        self.receiver = PositionReceiver(self.port)
+        self.receiver.start()
+        self.events.put(("listening", self.port))
+        self.guide_client = _start_mpv("gui-guide", self.guide, [
+            "--pause=yes", "--audio-display=no", "--no-video",
+            f"--start={self.guide_start:.3f}", "--keep-open=no",
+        ])
+        if self.guide_client is None:
+            self.events.put(("error", "mpv を起動できませんでした"))
+            return
+        try:
+            while not self._stop.is_set():
+                state = self.receiver.latest()
+                if state is None:
+                    time.sleep(0.2)
+                    continue
+                position = float(state.get("currentTime") or 0)
+                paused = bool(state.get("paused"))
+                target = position + self.guide_start
+                guide_time = self.guide_client.get_property("time-pos")
+                if paused:
+                    self.guide_client.set_property("pause", True)
+                else:
+                    self.guide_client.set_property("pause", False)
+                    if guide_time is None or abs(float(guide_time) - target) > 1.0:
+                        self.guide_client.command(["seek", target, "absolute+exact"])
+                self.events.put(("browser_position", (target, state.get("title") or "")))
+                time.sleep(self.interval)
+        finally:
+            self.guide_client.close()
+            self.receiver.stop()
+            self.events.put(("finished", None))
 
 
 class BuildDbWorker(threading.Thread):
@@ -289,6 +345,7 @@ class GuideApp:
         self.worker: Optional[SyncWorker] = None
         self.fingerprint_worker: Optional[FingerprintWorker] = None
         self.build_worker: Optional[BuildDbWorker] = None
+        self.position_worker: Optional[PositionWorker] = None
         self.waiting = WaitingPlayer()
         self.offset_file = Path(os.environ.get("TEMP", "/tmp")) / f"hmv-gui-offset-{os.getpid()}.txt"
         self.offset_file.write_text("0.000", encoding="utf-8")
@@ -357,6 +414,7 @@ class GuideApp:
         ttk.Button(actions, text="待機音声を再生", command=self._play_waiting).pack(side="left")
         ttk.Button(actions, text="映像＋ガイドを再生", command=self._play_sync).pack(side="left", padx=6)
         ttk.Button(actions, text="自動同期 (音声認識)", command=self._play_fingerprint).pack(side="left")
+        ttk.Button(actions, text="ブラウザの位置で同期", command=self._play_browser).pack(side="left", padx=6)
         ttk.Button(actions, text="停止", command=self._stop_all).pack(side="left", padx=6)
 
         ttk.Label(right, text="音声の入力元").pack(anchor="w", pady=(10, 0))
@@ -549,6 +607,19 @@ class GuideApp:
         self.fingerprint_worker.start()
         self.status.config(text=f"音を認識しています ({source_kind})... 再生開始を待っています")
 
+    def _play_browser(self) -> None:
+        """ブラウザ (Firefox 拡張) の再生位置に合わせてガイドを再生します (指紋 DB 不要)。"""
+        paths = self._guide_paths()
+        if paths is None:
+            return
+        guide, _ = paths
+        self._stop_all()
+        self.waiting.stop()
+        guide_start = float(self.guide_start_var.get() or 0)
+        self.position_worker = PositionWorker(str(guide), guide_start)
+        self.position_worker.start()
+        self.status.config(text="ブラウザの位置を待っています (拡張を読み込んでください)")
+
     def _stop_all(self) -> None:
         if self.worker is not None:
             self.worker.stop()
@@ -571,7 +642,7 @@ class GuideApp:
     # -------------------------------------------------- イベント
 
     def _poll_events(self) -> None:
-        for worker in (self.build_worker, self.worker, self.fingerprint_worker):
+        for worker in (self.build_worker, self.worker, self.fingerprint_worker, self.position_worker):
             if worker is None:
                 continue
             while True:
@@ -593,6 +664,12 @@ class GuideApp:
                 elif kind == "searching":
                     score = payload[0] if isinstance(payload, tuple) else payload
                     self.status.config(text=f"認識中... (相関 {score:.3f})")
+                elif kind == "browser_position":
+                    target, title = payload
+                    self.waiting.stop()
+                    self.status.config(text=f"ブラウザ位置: ガイド {target:.1f} 秒  ({str(title)[:36]})")
+                elif kind == "listening":
+                    self.status.config(text=f"ブラウザの位置を待っています (http://127.0.0.1:{payload}/position)")
                 elif kind == "build_progress":
                     done, total = payload
                     self.progress["value"] = done
