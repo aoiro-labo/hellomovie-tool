@@ -235,7 +235,10 @@ class FingerprintWorker(threading.Thread):
         except Exception as exc:  # noqa: BLE001
             self.events.put(("error", f"指紋 DB を読めませんでした: {exc}"))
             return
-        db = payload["packed"]
+        db = payload.get("features")
+        if db is None:
+            self.events.put(("error", "指紋 DB の形式が古いです。audio_sync.py build で作り直してください。"))
+            return
         base = payload.get("start", 0.0)
         source = audio_sync.AudioSource(self.source_kind, self.source_file, self.window)
         last_target = None
@@ -245,10 +248,10 @@ class FingerprintWorker(threading.Thread):
                 if len(samples) < audio_sync.FRAME * 2:
                     time.sleep(0.3)
                     continue
-                live = audio_sync.pack_nibbles(audio_sync.quantize(audio_sync.band_features(samples)))
-                position, votes, hits = audio_sync.match_position(db, live)
-                if position is None or votes < audio_sync.MIN_VOTES or hits < audio_sync.MIN_HITS:
-                    self.events.put(("searching", (votes, hits)))
+                live = audio_sync.band_features(samples)
+                position, score, sharp = audio_sync.match_position(db, live)
+                if position is None or score < audio_sync.MIN_SCORE or sharp != 1:
+                    self.events.put(("searching", score))
                     time.sleep(0.5)
                     continue
                 position += base
@@ -257,7 +260,7 @@ class FingerprintWorker(threading.Thread):
                     last_target = target
                     if self.player is None:
                         self.player = audio_sync.play_guide_from(self.guide, target)
-                    self.events.put(("recognized", (position, target)))
+                    self.events.put(("recognized", (position, target, score)))
                 time.sleep(self.interval)
         except Exception as exc:  # noqa: BLE001
             self.events.put(("error", str(exc)))
@@ -364,6 +367,15 @@ class GuideApp:
                         value="loopback").pack(side="left")
         ttk.Radiobutton(inputs, text="マイク (劇場のスピーカー)", variable=self.input_var,
                         value="mic").pack(side="left", padx=10)
+
+        ttk.Label(right, text="指紋 DB の参照元").pack(anchor="w", pady=(8, 0))
+        refs = ttk.Frame(right)
+        refs.pack(fill="x")
+        self.reference_var = tk.StringVar(value="movie")
+        ttk.Radiobutton(refs, text="映像ファイル (推奨)", variable=self.reference_var,
+                        value="movie").pack(side="left")
+        ttk.Radiobutton(refs, text="ガイド (非推奨)", variable=self.reference_var,
+                        value="guide").pack(side="left", padx=10)
 
         self.progress = ttk.Progressbar(right, mode="determinate")
         self.progress.pack(fill="x", pady=(8, 0))
@@ -505,18 +517,27 @@ class GuideApp:
         if paths is None:
             return
         guide, _ = paths
-        movie = self.movie_var.get().strip()
-        if not movie:
-            messagebox.showinfo("注意", "指紋 DB を作るために映像ファイルが必要です")
-            return
+        title_id = self._selected()
+
+        # 参照元: 音声案内版のガイドは自带に映画音があるので、それを基準にできる
+        # (手元に映像ファイルが無くても Netflix 配信を追従できる)
+        if self.reference_var.get() == "guide":
+            source = guide
+            db = self.library.folder / f"fp_guide_{title_id}.pkl"
+        else:
+            source = self.movie_var.get().strip()
+            if not source:
+                messagebox.showinfo("注意", "参照にする映像ファイルを選んでください")
+                return
+            db = self.library.folder / f"fp_{Path(source).stem}.pkl"
+
         self._stop_all()
         guide_start = float(self.guide_start_var.get() or 0)
         source_kind = self.input_var.get()
 
-        db = self.library.folder / f"fp_{Path(movie).stem}.pkl"
         if not db.exists():
             self.status.config(text="指紋 DB を作成しています (数分かかります)...")
-            self.build_worker = BuildDbWorker(movie, db)
+            self.build_worker = BuildDbWorker(str(source), db)
             self.build_worker.start()
             self._pending_fingerprint = (db, str(guide), guide_start, source_kind)
             return
@@ -565,13 +586,13 @@ class GuideApp:
                         f"補正 {self.offset:+.2f} 秒"
                     ))
                 elif kind == "recognized":
-                    position, target = payload
+                    position, target, score = payload
                     # _guide が始まったので待機音声は止める
                     self.waiting.stop()
-                    self.status.config(text=f"認識: 映画内 {position:.1f} 秒 → ガイド {target:.1f} 秒 (自動同期中)")
+                    self.status.config(text=f"認識: 映画内 {position:.1f} 秒 → ガイド {target:.1f} 秒 (相関 {score:.2f})")
                 elif kind == "searching":
-                    votes, hits = payload
-                    self.status.config(text=f"認識中... (得票 {votes} / ヒット {hits})")
+                    score = payload[0] if isinstance(payload, tuple) else payload
+                    self.status.config(text=f"認識中... (相関 {score:.3f})")
                 elif kind == "build_progress":
                     done, total = payload
                     self.progress["value"] = done

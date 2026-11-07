@@ -55,10 +55,11 @@ QUANT_BITS = 4    # 帯エネルギーの量子化ビット数 (0..15)
 # システム音 (ループバック) はサウンドカード側の処理 (ダウンミックス / EQ /
 # 空間効果など) を隔着するのでスペクトルが動き、距離が大きくなります。
 # そのため閾値を緩くし、得票の集中で判定します。
-MAX_DISTANCE = 12  # 何個の帯が違えば「一致」とみなさないか
+MAX_DISTANCE = 12  # 量子化ハッシュ方式の閾値 (旧方式) / 現在は FFT 相関を使う
 MIN_VOTES = 5       # これ以下の候補は採用しない
 MIN_HITS = 5        # ヒットした窓数の下限 (無音などはこれ以下)
 MIN_MARGIN = 2.0     # 最得票が 2 位の何倍である必要があるか
+MIN_SCORE = 0.60       # 相関スコアの下限 (一致 0.8〜 / 不一致 0.5 前後)
 
 # 16 進 1 桁あたりの popcount
 POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
@@ -186,10 +187,15 @@ def _features_of_chunk(movie: str, start: float, duration: float) -> tuple[int, 
 
 def build_db(movie: str, out: str, start: float = 0.0, duration: Optional[float] = None,
              chunk: float = 600.0, workers: int = 4, progress=None) -> None:
-    """映画音声から指紋 DB を作ります (区間を並列デコード)。"""
+    """参照音源から指紋 DB を作ります (区間を並列デコード)。
+
+    保存するのは帯エネルギーの列 (float16) です。量子化arks ではなく生の値を
+    持っておくと、照合の-DFT 相関で「参照にナレーションが混ざっている」ような
+    場合でも位置を推定できます。
+    """
     import concurrent.futures
 
-    print(f"映画音声を解析しています: {movie}", flush=True)
+    print(f"参照音源を解析しています: {movie}", flush=True)
     total = duration if duration else probe_duration(movie)
     bounds = _chunk_bounds(max(total - start, 0.0), chunk)
     print(f"  {total:.1f} 秒を {len(bounds)} 区間に分けて {workers} 並列で解析します", flush=True)
@@ -206,19 +212,72 @@ def build_db(movie: str, out: str, start: float = 0.0, duration: Optional[float]
                 progress(done, len(bounds))
             print(f"  {done}/{len(bounds)} 区間完了", flush=True)
 
-    # 区間の順序を戻して連結する (フレームは独立なので境界の重複はない)
     parts.sort(key=lambda item: item[0])
     features = np.concatenate([item[1] for item in parts if len(item[1])], axis=0) if parts else \
         np.zeros((0, NBANDS), dtype=np.float32)
-    packed = pack_nibbles(quantize(features))
-    payload = {"version": 2, "sr": SR, "frame": FRAME, "hop": HOP, "nbands": NBANDS,
-               "start": start, "total": total, "packed": packed}
+    payload = {"version": 3, "sr": SR, "frame": FRAME, "hop": HOP, "nbands": NBANDS,
+               "start": start, "total": total,
+               "features": features.astype(np.float16),
+               "packed": pack_nibbles(quantize(features))}
     Path(out).write_bytes(pickle.dumps(payload, protocol=4))
-    print(f"完成: {out} ({len(packed):,} 窓, {Path(out).stat().st_size/1024/1024:.1f} MB)", flush=True)
+    print(f"完成: {out} ({len(features):,} 窓, {Path(out).stat().st_size/1024/1024:.1f} MB)", flush=True)
 
 
-def match_position(db: np.ndarray, live: np.ndarray) -> Tuple[Optional[float], int, int]:
-    """ライブ指紋から映画内の位置 (秒) を推定します。
+def match_position(db: np.ndarray, live: np.ndarray) -> Tuple[Optional[float], float, int]:
+    """帯シーケンスの相互相関で位置を推定します。
+
+    量子化ハッシュではなく「帯エネルギーの並び」を丸ごと相関させるので、
+    参照にナレーションが混ざっている場合や、音の出力側でスペクトルが
+    動いた場合でも位置を推定できます。
+
+    Args:
+        db (np.ndarray): 参照の帯特徴量 (フレーム数, NBANDS)
+        live (np.ndarray): ライブの帯特徴量 (フレーム数, NBANDS)
+
+    Returns:
+        (位置の秒, 相関スコア, ピークの鋭さ 0/1)
+    """
+    if len(db) < 8 or len(live) < 4:
+        return None, 0.0, 0
+    db = np.asarray(db, dtype=np.float32)
+    live = np.asarray(live, dtype=np.float32)
+    # フレームごとに正規化 (音量や coloration の影響を消す)
+    db = (db - db.mean(axis=1, keepdims=True)) / (db.std(axis=1, keepdims=True) + 1e-6)
+    live = (live - live.mean(axis=1, keepdims=True)) / (live.std(axis=1, keepdims=True) + 1e-6)
+
+    size = len(live)
+    n = 1 << int(np.ceil(np.log2(len(db) + size)))
+    shifted = np.zeros((n, db.shape[1]), dtype=np.float32)
+    shifted[:len(db)] = db
+    window = np.zeros((n, live.shape[1]), dtype=np.float32)
+    window[:size] = live
+    # 巡回相互相関: corr[k] = Σ_t db[k+t] * live[t] (k が一致する位置で最大)
+    correlation = np.fft.irfft(
+        np.fft.rfft(shifted, axis=0) * np.conj(np.fft.rfft(window, axis=0)), n, axis=0
+    ).sum(axis=1)
+
+    usable = correlation[:len(db) + size]
+    if usable.size < 4:
+        return None, 0.0, 0
+    best = int(np.argmax(usable))
+    peak = float(usable[best])
+    background = float(np.median(np.abs(usable))) + 1e-6
+    # ピークが背景から十分離れているか
+    if peak < background * 1.5:
+        return None, peak / (size * NBANDS), 0
+    position = best * HOP / SR
+    if position < 0:
+        return None, peak / (size * NBANDS), 0
+    score = peak / (size * NBANDS)
+    sharp = 1 if peak > background * 1.8 else 0
+    return position, score, sharp
+
+
+def match_position_hash(db: np.ndarray, live: np.ndarray) -> Tuple[Optional[float], int, int]:
+    """量子化ハッシュによる照合 (旧方式)。
+
+    参照とライブが完全に同じ音の場合に精密ですが、
+    参照にナレーションが混ざると合焦しません。match_position を推奨。
 
     Returns:
         (位置の秒, 得票数, ヒットした窓数)
@@ -324,13 +383,16 @@ def play_guide_from(guide: str, position: float, player: str = "mpv") -> Optiona
 # ---------------------------------------------------------------- コマンド
 
 def cmd_build(args) -> int:
-    build_db(args.movie, args.out, start=args.start, duration=args.duration)
+    source = args.guide or args.movie
+    if source is None:
+        sys.exit("--guide か --movie のどちらかを指定してください。")
+    build_db(source, args.out, start=args.start, duration=args.duration)
     return 0
 
 
 def cmd_watch(args) -> int:
     payload = pickle.loads(Path(args.db).read_bytes())
-    db = payload["packed"]
+    db = payload["features"]
     base = payload.get("start", 0.0)
     print(f"指紋 DB: {args.db} ({len(db):,} 窓, 映画長 {payload['total']:.1f} 秒, 開始 {base:.1f} 秒)")
 
@@ -344,15 +406,15 @@ def cmd_watch(args) -> int:
             if len(samples) < FRAME * 2:
                 time.sleep(0.2)
                 continue
-            live = pack_nibbles(quantize(band_features(samples)))
-            position, votes, hits = match_position(db, live)
-            if position is None or votes < MIN_VOTES or hits < MIN_HITS:
-                print(f"  認識中... (得票 {votes} / ヒット {hits})", end="\r", flush=True)
+            live = band_features(samples)
+            position, score, sharp = match_position(db, live)
+            if position is None or score < MIN_SCORE:
+                print(f"  認識中... (相関 {score:.3f})", end="\r", flush=True)
                 time.sleep(0.3)
                 continue
 
             position += base
-            print(f"\n認識: 映画内の {position:8.1f} 秒 (得票 {votes} / ヒット {hits})")
+            print(f"\n認識: 映画内の {position:8.1f} 秒 (相関 {score:.3f})")
             target = position + args.guide_start
             if guide_position is None or abs(target - guide_position) > 1.0:
                 if proc is None:
@@ -375,8 +437,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build", help="映画ファイルから指紋 DB を作る")
-    b.add_argument("--movie", required=True)
+    b = sub.add_parser("build", help="指紋 DB を作る (参照にする音源を指定)")
+    b.add_argument("--movie", default=None, help="参照にする映像ファイル (手元に映像がある場合)")
+    b.add_argument("--guide", default=None,
+                   help="参照にするガイド (音声案内版ならガイド自带に映画音があるので映像は不要)")
     b.add_argument("--out", default="fp_movie.pkl")
     b.add_argument("--start", type=float, default=0.0, help="解析開始位置 (秒)")
     b.add_argument("--duration", type=float, default=None, help="解析する長さ (秒)")
